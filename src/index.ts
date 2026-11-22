@@ -264,6 +264,7 @@ export {
   WalletConnectChainIdMismatchError,
   WalletNetworkMismatchError,
   CheckInDuringGracePeriodError,
+  GracePeriodExceedsCheckinPeriodError,
   WebSocketNotConfiguredError,
   WillContractError,
   WillNotActiveError,
