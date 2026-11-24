@@ -110,6 +110,14 @@ export type {
 } from './types';
 export { SOROBAN_EVENT_TYPES, WillStatus, WillErrorCode } from './types';
 
+export { compareWills } from './willComparison';
+export type {
+  CompareWillsOptions,
+  WillComparison,
+  WillComparisonEntry,
+  WillFieldName,
+} from './willComparison';
+
 export {
   DEFAULT_FREIGHTER_CONNECT_TIMEOUT_MS,
   FreighterWalletAdapter,
