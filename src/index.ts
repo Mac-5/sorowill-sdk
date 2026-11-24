@@ -363,6 +363,30 @@ export {
 export type { NextActionableState } from './utils';
 
 export {
+  DistributionAllocationError,
+  InvalidDistributionConditionError,
+  evaluateDistributionCondition,
+  planConditionalDistribution,
+} from './conditionalDistribution';
+export type {
+  AndCondition,
+  BalanceAtLeastCondition,
+  ComparisonCondition,
+  ComparisonOperator,
+  ConditionContext,
+  ConditionalDistributionAllocation,
+  ConditionalDistributionOptions,
+  ConditionalDistributionPlan,
+  ConditionalDistributionRule,
+  DistributionCondition,
+  NotCondition,
+  OrCondition,
+  TimeAfterCondition,
+  TimeBeforeCondition,
+  WillStatusCondition,
+} from './conditionalDistribution';
+
+export {
   DEFAULT_NETWORK,
   getDefaultContractId,
   resolveSoroWillConfig,
