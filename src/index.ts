@@ -10,6 +10,7 @@
 export {
   SoroWillClient,
   parseWillId,
+  computeGuardianQuorum,
   SoroWillInvalidIdError,
   buildContractDataLedgerKey,
   buildContractInstanceLedgerKey,
@@ -20,6 +21,7 @@ export type {
   EventSubscription,
   EventSubscriptionOptions,
   EventSubscriptionTransport,
+  GuardianQuorum,
   RpcRetryOptions,
   SoroWillClientOptions,
   SoroWillNetwork,

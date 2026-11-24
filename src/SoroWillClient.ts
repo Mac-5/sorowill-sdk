@@ -211,6 +211,41 @@ export const NETWORK_CONFIG: Record<SoroWillNetwork, NetworkConfig> = {
   },
 };
 
+/**
+ * Guardian quorum state for a will, as returned by
+ * {@link SoroWillClient.getGuardianQuorum}.
+ */
+export interface GuardianQuorum {
+  /** Number of guardians that must vote to reach quorum (0 when there are no guardians). */
+  readonly quorumSize: number;
+  /** Number of guardians currently configured on the will. */
+  readonly guardianCount: number;
+  /** Number of additional guardian votes still needed to reach quorum. */
+  readonly votesNeeded: number;
+  /** Number of distinct guardians who have already voted in the current cycle. */
+  readonly votesCast: number;
+}
+
+/**
+ * Computes the guardian quorum for a will from its guardian list and the
+ * number of votes already cast. Quorum is a strict majority of guardians
+ * (`floor(count / 2) + 1`); a will with no guardians has a quorum of 0.
+ */
+export function computeGuardianQuorum(
+  guardianCount: number,
+  votesCast: number,
+): GuardianQuorum {
+  const count = Number.isFinite(guardianCount) && guardianCount > 0 ? Math.floor(guardianCount) : 0;
+  const cast = Number.isFinite(votesCast) && votesCast > 0 ? Math.floor(votesCast) : 0;
+  const quorumSize = count === 0 ? 0 : Math.floor(count / 2) + 1;
+  return {
+    quorumSize,
+    guardianCount: count,
+    votesNeeded: Math.max(0, quorumSize - cast),
+    votesCast: cast,
+  };
+}
+
 export interface RpcRetryOptions {
   maxAttempts: number;
   initialDelayMs: number;
@@ -2431,6 +2466,32 @@ export class SoroWillClient {
     const { status } = mapWill(raw);
     this.statusCache.set(canonicalWillId, { status, expiresAt: now + WILL_STATUS_CACHE_TTL_MS });
     return status;
+  }
+
+  /**
+   * Returns the guardian quorum state for `willId`: the quorum size (strict
+   * majority of guardians), the number of guardians configured, and how many
+   * additional guardian votes are still needed. Does not require a connected
+   * wallet.
+   *
+   * **Read-only operation** — served from the same read cache as
+   * {@link SoroWillClient.getWill}.
+   *
+   * @param willId - The on-chain will ID.
+   * @param options - Optional per-call timeout and abort signal.
+   * @returns The will's {@link GuardianQuorum}.
+   * @throws {SoroWillInvalidIdError} If `willId` is not a valid numeric ID.
+   * @throws {WillNotFoundError} If the will does not exist on-chain.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   *
+   * @example
+   * ```ts
+   * const { quorumSize, guardianCount, votesNeeded } = await client.getGuardianQuorum('1');
+   * ```
+   */
+  async getGuardianQuorum(willId: string, options?: RequestOptions): Promise<GuardianQuorum> {
+    const will = await this.getWill(willId, options);
+    return computeGuardianQuorum(will.guardians.length, will.guardianVotes);
   }
 
   /**
