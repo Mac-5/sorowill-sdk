@@ -56,6 +56,11 @@ export enum ErrorCode {
   WALLET_NETWORK_MISMATCH = 'WALLET_NETWORK_MISMATCH',
   VALIDATION_ERROR = 'VALIDATION_ERROR',
   UNKNOWN_ERROR = 'UNKNOWN_ERROR',
+
+  // Client-side encryption errors (#820)
+  ENCRYPTION_ERROR = 'ENCRYPTION_ERROR',
+  DECRYPTION_ERROR = 'DECRYPTION_ERROR',
+  KEY_MANAGEMENT_ERROR = 'KEY_MANAGEMENT_ERROR',
 }
 
 /** Structured user-facing error representation with recovery guidance. */

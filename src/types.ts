@@ -313,6 +313,14 @@ export interface Will {
    * @since 0.1.0
    */
   readonly guardianVotes: number;
+  /**
+   * Client-side encrypted payload attached to this will, if any. Opaque
+   * ciphertext: decrypt it with {@link SoroWillClient.decryptWillData} and the
+   * same key used at creation time.
+   *
+   * @since 0.1.3
+   */
+  readonly encryptedData?: string;
 }
 
 /** Parameters for {@link SoroWillClient.createWill}. */
@@ -333,6 +341,16 @@ export interface CreateWillParams {
   readonly gracePeriodDays: number;
   /** 0 to 3 guardian addresses that may jointly force an early release. */
   readonly guardians: readonly string[];
+  /**
+   * Optional free-form, client-side metadata (e.g. a personal note for the
+   * beneficiaries). When an encryption key is supplied to
+   * {@link SoroWillClient.createWill}, this field is encrypted at rest before
+   * it leaves the client and is only readable via
+   * {@link SoroWillClient.decryptWillData}.
+   *
+   * @since 0.1.3
+   */
+  readonly encryptedData?: string;
 }
 
 /** Parameters for {@link SoroWillClient.updateBeneficiaries}. */
