@@ -83,6 +83,7 @@ import {
   RequestTimeoutError,
   mapContractError,
   SimulationError,
+  SoroWillConfigError,
   SoroWillError,
   SoroWillInvalidAmountError,
   SoroWillRestoreRequiredError,
@@ -305,9 +306,16 @@ export type {
 
 /** Options for constructing a {@link SoroWillClient}. */
 export interface SoroWillClientOptions {
-  /** Which Stellar network to connect to. */
+  /**
+   * Which Stellar network to connect to. Must be `"testnet"` or `"mainnet"`;
+   * any other value throws {@link SoroWillConfigError} at construction.
+   */
   network: SoroWillNetwork;
-  /** The deployed SoroWill contract's address. */
+  /**
+   * The deployed SoroWill contract's address. Must be a 56-character StrKey
+   * starting with `C`; otherwise {@link InvalidContractIdError} is thrown at
+   * construction.
+   */
   contractId: string;
   /** Optional hook manager for intercepting contract calls. */
   hooks?: HookManager;
@@ -422,13 +430,28 @@ export interface SoroWillClientOptions {
    * {@link SoroWillClient.contractSpecVersion}.
    */
   expectedContractVersion?: string;
-  /** Optional override for the Soroban RPC endpoint. */
+  /**
+   * Optional override for the Soroban RPC endpoint. Must be an absolute
+   * `http://` or `https://` URL; otherwise {@link SoroWillConfigError} is
+   * thrown at construction.
+   */
   rpcUrl?: string;
-  /** Optional override for the Stellar network passphrase. */
+  /**
+   * Optional override for the Stellar network passphrase. Must be a non-empty
+   * string; otherwise {@link SoroWillConfigError} is thrown at construction.
+   */
   networkPassphrase?: string;
-  /** Optional override for the endpoint used for event polling. */
+  /**
+   * Optional override for the endpoint used for event polling. Must be an
+   * absolute `http://` or `https://` URL; otherwise {@link SoroWillConfigError}
+   * is thrown at construction.
+   */
   eventRpcUrl?: string;
-  /** Optional override for the WebSocket event streaming endpoint. */
+  /**
+   * Optional override for the WebSocket event streaming endpoint. Must be an
+   * absolute `wss://` URL; otherwise {@link InvalidWebSocketUrlError} is thrown
+   * at construction.
+   */
   eventStreamUrl?: string;
   /**
    * Optional Server-Sent Events (SSE) endpoint used for real-time event
@@ -474,20 +497,36 @@ export interface SoroWillClientOptions {
   fetch?: FetchImplementation;
   /** Internal/testing override for WebSocket construction. */
   webSocketFactory?: (url: string) => WebSocketLike;
-  /** Default timeout applied to each RPC request. Defaults to 30 seconds. */
+  /**
+   * Default timeout applied to each RPC request, in milliseconds. Must be a
+   * finite number greater than zero. Defaults to 30 seconds.
+   */
   timeoutMs?: number;
-  /** Maximum number of RPC requests in flight at once. Defaults to 4. */
+  /**
+   * Maximum number of RPC requests in flight at once. Must be a positive
+   * integer. Defaults to 4.
+   */
   maxConcurrentRequests?: number;
-  /** Maximum RPC requests started in a rolling one-second window. Defaults to 10. */
+  /**
+   * Maximum RPC requests started in a rolling one-second window. Must be a
+   * positive integer. Defaults to 10.
+   */
   requestsPerSecond?: number;
   /**
    * Maximum number of RPC requests allowed to wait in the client's request
    * queue at once. Defaults to 1000. Requests enqueued while the queue is
    * full are rejected with a `RequestQueueOverflowError` instead of growing
    * the queue without bound (#525).
+   *
+   * Must be a positive integer; otherwise {@link SoroWillConfigError} is thrown
+   * at construction.
    */
   maxQueueSize?: number;
-  /** Optional list of RPC endpoints to use with automatic failover. */
+  /**
+   * Optional list of RPC endpoints to use with automatic failover. Must be a
+   * non-empty array of absolute `http://` or `https://` URLs; otherwise
+   * {@link SoroWillConfigError} is thrown at construction.
+   */
   rpcUrls?: string[];
   /**
    * Whether to probe configured RPC endpoints on startup to deprioritize
@@ -525,6 +564,9 @@ export interface SoroWillClientOptions {
   /**
    * Maximum number of poll attempts for transaction finality.
    * Defaults to 30. Increase under mainnet congestion.
+   *
+   * Must be a positive integer; otherwise {@link SoroWillConfigError} is thrown
+   * at construction.
    */
   pollAttempts?: number;
   /**
@@ -763,6 +805,85 @@ function cloneWill(will: Will): Will {
     guardians: [...will.guardians],
     lastCheckin: new Date(will.lastCheckin.getTime()),
     triggerTime: will.triggerTime === null ? null : new Date(will.triggerTime.getTime()),
+  };
+}
+
+/** Default lifetime of a guardian vote before it expires, in milliseconds (24h). */
+export const DEFAULT_GUARDIAN_VOTE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Per-guardian vote state returned by {@link SoroWillClient.getGuardianVotingStatus}. */
+export interface GuardianVoteStatus {
+  /** The guardian address. */
+  readonly guardian: string;
+  /** Whether this guardian has cast a vote in the current release cycle. */
+  readonly hasVoted: boolean;
+  /** When the guardian voted, or `null` if they have not voted. */
+  readonly votedAt: Date | null;
+  /** When the vote expires, or `null` if the guardian has not voted. */
+  readonly expiresAt: Date | null;
+  /** `true` when the guardian voted but the vote has since expired. */
+  readonly expired: boolean;
+}
+
+/** Aggregate guardian voting status for a will. */
+export interface GuardianVotingStatus {
+  /** The will ID these votes belong to. */
+  readonly willId: string;
+  /** Number of distinct guardians who have voted in the current cycle. */
+  readonly votesCast: number;
+  /** Number of guardians required to release the will (2 of N). */
+  readonly votesRequired: number;
+  /** `true` when enough unexpired votes exist to release the will. */
+  readonly thresholdReached: boolean;
+  /** Per-guardian vote details, in the will's guardian order. */
+  readonly guardians: readonly GuardianVoteStatus[];
+}
+
+/**
+ * Builds the per-guardian voting status for a will from its guardian list,
+ * vote count and the timestamps of the votes cast (#800).
+ *
+ * The contract only exposes the aggregate `guardian_votes` count, so vote
+ * timestamps are attributed in guardian order: the first `votesCast` guardians
+ * are treated as the voters. A vote is expired when `now - votedAt` exceeds
+ * `ttlMs`; expired votes no longer count toward the release threshold.
+ */
+export function buildGuardianVotingStatus(
+  will: Pick<Will, 'id' | 'guardians' | 'guardianVotes'>,
+  voteTimestamps: readonly (Date | number | null | undefined)[] = [],
+  options: { now?: number; ttlMs?: number } = {},
+): GuardianVotingStatus {
+  const now = options.now ?? Date.now();
+  const ttlMs = options.ttlMs ?? DEFAULT_GUARDIAN_VOTE_TTL_MS;
+  const votesRequired = 2;
+  const votesCast = Math.max(0, Math.min(will.guardianVotes, will.guardians.length));
+
+  const guardians: GuardianVoteStatus[] = will.guardians.map((guardian, index) => {
+    const rawTimestamp = voteTimestamps[index];
+    const votedAt =
+      index < votesCast && rawTimestamp !== null && rawTimestamp !== undefined
+        ? rawTimestamp instanceof Date
+          ? new Date(rawTimestamp.getTime())
+          : new Date(rawTimestamp)
+        : null;
+    const expiresAt = votedAt === null ? null : new Date(votedAt.getTime() + ttlMs);
+    const expired = expiresAt !== null && expiresAt.getTime() <= now;
+    return {
+      guardian,
+      hasVoted: index < votesCast,
+      votedAt,
+      expiresAt,
+      expired,
+    };
+  });
+
+  const activeVotes = guardians.filter((g) => g.hasVoted && !g.expired).length;
+  return {
+    willId: will.id,
+    votesCast,
+    votesRequired,
+    thresholdReached: activeVotes >= votesRequired,
+    guardians,
   };
 }
 
@@ -1173,6 +1294,218 @@ function validateContractIdFormat(contractId: unknown): asserts contractId is st
   }
 }
 
+/** Returns `true` when `value` is an absolute `http(s)://` URL. */
+function isHttpUrl(value: unknown): value is string {
+  if (typeof value !== 'string' || value.trim() === '') return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/** Returns `true` when `value` is an absolute `wss://` URL. */
+function isSecureWebSocketUrl(value: unknown): value is string {
+  if (typeof value !== 'string' || value.trim() === '') return false;
+  try {
+    return new URL(value).protocol === 'wss:';
+  } catch {
+    return false;
+  }
+}
+
+function assertOptionalBoolean(option: string, value: unknown): void {
+  if (value !== undefined && typeof value !== 'boolean') {
+    throw new SoroWillConfigError(option, 'must be a boolean.', value);
+  }
+}
+
+function assertOptionalPositiveInteger(option: string, value: unknown): void {
+  if (value === undefined) return;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    throw new SoroWillConfigError(option, 'must be a positive integer.', value);
+  }
+}
+
+function assertOptionalPositiveNumber(option: string, value: unknown): void {
+  if (value === undefined) return;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    throw new SoroWillConfigError(option, 'must be a finite number greater than zero.', value);
+  }
+}
+
+function assertOptionalHttpUrl(option: string, value: unknown): void {
+  if (value === undefined) return;
+  if (!isHttpUrl(value)) {
+    throw new SoroWillConfigError(
+      option,
+      'must be an absolute http:// or https:// URL (for example "https://soroban-testnet.stellar.org").',
+      value,
+    );
+  }
+}
+
+/**
+ * Validates every option passed to the {@link SoroWillClient} constructor
+ * (#798). Throws a {@link SoroWillConfigError} naming the offending option and
+ * why it was rejected, so misconfiguration fails fast at init instead of
+ * surfacing as a cryptic error on the first RPC call.
+ *
+ * @param options - The raw constructor options.
+ * @throws {SoroWillConfigError} when any option is invalid.
+ */
+function validateClientOptions(options: SoroWillClientOptions): void {
+  if (options === null || typeof options !== 'object') {
+    throw new SoroWillConfigError(
+      'options',
+      'a configuration object is required, e.g. { network: "testnet", contractId: "C..." }.',
+      options,
+    );
+  }
+
+  if (options.network !== 'testnet' && options.network !== 'mainnet') {
+    throw new SoroWillConfigError(
+      'network',
+      `must be one of "testnet" or "mainnet" (received ${JSON.stringify(options.network)}).`,
+      options.network,
+    );
+  }
+
+  validateContractIdFormat(options.contractId);
+
+  assertOptionalHttpUrl('rpcUrl', options.rpcUrl);
+  assertOptionalHttpUrl('eventRpcUrl', options.eventRpcUrl);
+
+  if (options.rpcUrls !== undefined) {
+    if (!Array.isArray(options.rpcUrls) || options.rpcUrls.length === 0) {
+      throw new SoroWillConfigError(
+        'rpcUrls',
+        'must be a non-empty array of http:// or https:// URLs.',
+        options.rpcUrls,
+      );
+    }
+    options.rpcUrls.forEach((url, index) => {
+      if (!isHttpUrl(url)) {
+        throw new SoroWillConfigError(
+          `rpcUrls[${index}]`,
+          'must be an absolute http:// or https:// URL.',
+          url,
+        );
+      }
+    });
+  }
+
+  if (options.eventStreamUrl !== undefined && !isSecureWebSocketUrl(options.eventStreamUrl)) {
+    throw new InvalidWebSocketUrlError(String(options.eventStreamUrl));
+  }
+
+  if (options.networkPassphrase !== undefined) {
+    if (typeof options.networkPassphrase !== 'string' || options.networkPassphrase.trim() === '') {
+      throw new SoroWillConfigError(
+        'networkPassphrase',
+        'must be a non-empty string (for example "Test SDF Network ; September 2015").',
+        options.networkPassphrase,
+      );
+    }
+  }
+
+  if (options.expectedContractVersion !== undefined) {
+    if (
+      typeof options.expectedContractVersion !== 'string' ||
+      options.expectedContractVersion.trim() === ''
+    ) {
+      throw new SoroWillConfigError(
+        'expectedContractVersion',
+        'must be a non-empty version string (for example "1.2.0").',
+        options.expectedContractVersion,
+      );
+    }
+  }
+
+  assertOptionalPositiveInteger('pollAttempts', options.pollAttempts);
+  assertOptionalPositiveInteger('maxConcurrentRequests', options.maxConcurrentRequests);
+  assertOptionalPositiveInteger('requestsPerSecond', options.requestsPerSecond);
+  assertOptionalPositiveInteger('maxQueueSize', options.maxQueueSize);
+  assertOptionalPositiveNumber('timeoutMs', options.timeoutMs);
+  assertOptionalPositiveNumber('defaultPollIntervalMs', options.defaultPollIntervalMs);
+  assertOptionalPositiveNumber('transactionTimeoutSeconds', options.transactionTimeoutSeconds);
+
+  if (options.specCacheTtlMs !== undefined && options.specCacheTtlMs !== Infinity) {
+    assertOptionalPositiveNumber('specCacheTtlMs', options.specCacheTtlMs);
+  }
+
+  assertOptionalBoolean('readOnly', options.readOnly);
+  assertOptionalBoolean('debug', options.debug);
+  assertOptionalBoolean('deepFreeze', options.deepFreeze);
+  assertOptionalBoolean('deduplicateReads', options.deduplicateReads);
+  assertOptionalBoolean('autoFeeBumpOnTimeout', options.autoFeeBumpOnTimeout);
+  assertOptionalBoolean('requireWalletNetwork', options.requireWalletNetwork);
+  assertOptionalBoolean('checkHealthOnStartup', options.checkHealthOnStartup);
+
+  if (options.readCache !== undefined && options.readCache !== false) {
+    if (typeof options.readCache !== 'object' || options.readCache === null) {
+      throw new SoroWillConfigError(
+        'readCache',
+        'must be a ReadCacheOptions object or false to disable caching.',
+        options.readCache,
+      );
+    }
+  }
+
+  if (options.retry !== undefined) {
+    if (typeof options.retry !== 'object' || options.retry === null) {
+      throw new SoroWillConfigError(
+        'retry',
+        'must be a partial RpcRetryOptions object.',
+        options.retry,
+      );
+    }
+    const { maxAttempts, initialDelayMs, maxDelayMs, backoffFactor } = options.retry;
+    if (maxAttempts !== undefined) {
+      assertOptionalPositiveInteger('retry.maxAttempts', maxAttempts);
+    }
+    if (initialDelayMs !== undefined) {
+      if (typeof initialDelayMs !== 'number' || !Number.isFinite(initialDelayMs) || initialDelayMs < 0) {
+        throw new SoroWillConfigError(
+          'retry.initialDelayMs',
+          'must be a finite, non-negative number.',
+          initialDelayMs,
+        );
+      }
+    }
+    if (maxDelayMs !== undefined) {
+      if (typeof maxDelayMs !== 'number' || !Number.isFinite(maxDelayMs) || maxDelayMs < 0) {
+        throw new SoroWillConfigError(
+          'retry.maxDelayMs',
+          'must be a finite, non-negative number.',
+          maxDelayMs,
+        );
+      }
+    }
+    if (backoffFactor !== undefined) {
+      if (typeof backoffFactor !== 'number' || !Number.isFinite(backoffFactor) || backoffFactor < 1) {
+        throw new SoroWillConfigError(
+          'retry.backoffFactor',
+          'must be a finite number of at least 1.',
+          backoffFactor,
+        );
+      }
+    }
+  }
+
+  if (options.fetch !== undefined && typeof options.fetch !== 'function') {
+    throw new SoroWillConfigError('fetch', 'must be a fetch-compatible function.', options.fetch);
+  }
+  if (options.webSocketFactory !== undefined && typeof options.webSocketFactory !== 'function') {
+    throw new SoroWillConfigError(
+      'webSocketFactory',
+      'must be a function that returns a WebSocket-like object.',
+      options.webSocketFactory,
+    );
+  }
+}
+
 /** How long {@link SoroWillClient.willStatus} may serve a cached status (#726). */
 const WILL_STATUS_CACHE_TTL_MS = 30_000;
 
@@ -1281,9 +1614,9 @@ export class SoroWillClient {
   private requireWalletNetwork: boolean = false;
 
   constructor(options: SoroWillClientOptions) {
-    // Validate contract ID format on initialization (#626).
+    // Validate the whole configuration on initialization (#798, #626).
     // This catches configuration errors early, before the first operation.
-    validateContractIdFormat(options.contractId);
+    validateClientOptions(options);
 
     const config = NETWORK_CONFIG[options.network];
     const rpcUrl = options.rpcUrl ?? config.rpcUrls[0]!;
@@ -2526,6 +2859,33 @@ export class SoroWillClient {
     const { status } = mapWill(raw);
     this.statusCache.set(canonicalWillId, { status, expiresAt: now + WILL_STATUS_CACHE_TTL_MS });
     return status;
+  }
+
+  /**
+   * Returns the guardian voting status of `willId`, including per-guardian
+   * vote details, vote timestamps and whether each vote has expired (#800).
+   *
+   * The contract exposes only the aggregate vote count, so vote timestamps are
+   * attributed in guardian order (the first `votesCast` guardians are treated
+   * as the voters). Votes older than `voteTtlMs` (default 24h) are reported as
+   * `expired` and no longer count toward the 2-of-N release threshold.
+   *
+   * @param willId - The will to inspect.
+   * @param options - Optional request options plus `voteTtlMs` / `now` overrides.
+   * @returns The aggregate and per-guardian voting status.
+   * @throws {SoroWillInvalidIdError} If `willId` is not a valid numeric ID.
+   * @throws {WillNotFoundError} If the will does not exist on-chain.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   */
+  async getGuardianVotingStatus(
+    willId: string,
+    options?: RequestOptions & { voteTtlMs?: number; now?: number },
+  ): Promise<GuardianVotingStatus> {
+    const will = await this.getWill(willId, options);
+    return buildGuardianVotingStatus(will, [], {
+      now: options?.now,
+      ttlMs: options?.voteTtlMs,
+    });
   }
 
   /**
@@ -5243,6 +5603,46 @@ export class SoroWillClient {
     const transaction =
       builtTx ?? (await this.buildInvocationTransaction(method, args, sourcePublicKey));
     return this.rpcPool.withFailover((server) => server.prepareTransaction(transaction));
+  }
+
+  /**
+   * Simulate a contract invocation without signing or submitting it (#797).
+   *
+   * Builds the invocation transaction, runs a Soroban simulation and returns a
+   * preview of the outcome. Nothing is committed to the ledger and no wallet
+   * signature is requested. On failure the raw simulation error is exposed as
+   * the typed `simulationError` property (never in `message`).
+   */
+  async simulateInvocation(
+    method: string,
+    args: Record<string, unknown> = {},
+    options?: { sourcePublicKey?: string },
+  ): Promise<SimulationPreview> {
+    const transaction = await this.buildInvocationTransaction(
+      method,
+      args,
+      options?.sourcePublicKey,
+    );
+    const response = await this.rpcPool.withFailover((server) =>
+      server.simulateTransaction(transaction),
+    );
+
+    const success = rpc.Api.isSimulationSuccess(response);
+    const rawError = success ? undefined : rpc.Api.isSimulationError(response) ? response.error : undefined;
+    const minResourceFee = success ? response.minResourceFee : undefined;
+    const transactionData = success ? response.transactionData : undefined;
+    const result = success ? response.result : undefined;
+
+    return {
+      success,
+      method,
+      minResourceFee,
+      fee: minResourceFee !== undefined ? String(BigInt(BASE_FEE) + BigInt(minResourceFee)) : undefined,
+      returnValue: result?.retval,
+      transactionData,
+      simulationError: rawError,
+      error: rawError,
+    };
   }
 
   private async getWalletPublicKey(): Promise<string> {

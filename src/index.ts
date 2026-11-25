@@ -302,6 +302,7 @@ export {
   SameWillIdError,
   SignTransactionTimeoutError,
   SimulationError,
+  SoroWillConfigError,
   SoroWillError,
   SoroWillInvalidAmountError,
   SoroWillRestoreRequiredError,
