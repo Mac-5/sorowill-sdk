@@ -31,6 +31,7 @@ export type {
   SoroWillNetwork,
   SoroWillRpcServer,
   SoroWillReadCacheOptions,
+  SignedTransactionResult,
 } from './SoroWillClient';
 export { DEFAULT_CONTRACT_IDS } from './SoroWillClient';
 export {
@@ -172,6 +173,8 @@ export {
 export type {
   CacheGetResult,
   CachePersistenceAdapter,
+  CacheQueryOptions,
+  CacheStrategy,
   PersistedCacheEntry,
   ReadCacheOptions,
 } from './cache';
@@ -272,6 +275,7 @@ export {
   CheckInDuringGracePeriodError,
   GracePeriodExceedsCheckinPeriodError,
   WebSocketNotConfiguredError,
+  SseNotConfiguredError,
   WillContractError,
   WillNotActiveError,
   WillNotBothActiveError,
@@ -298,6 +302,7 @@ export {
   DEFAULT_MAX_QUEUE_SIZE,
   RequestQueue,
   RequestPriority,
+  DEFAULT_PRIORITIES,
   getSharedRequestQueue,
   releaseSharedRequestQueue,
   computeBackoffDelay,
