@@ -10,6 +10,12 @@ export interface CachePersistenceAdapter {
   write(entry: PersistedCacheEntry): Promise<void>;
   delete(key: string): Promise<void>;
   clear(): Promise<void>;
+  /**
+   * Optional differential write: applies only the changed fields to the stored
+   * entry instead of rewriting the whole value. Adapters that omit this method
+   * fall back to {@link CachePersistenceAdapter.write}.
+   */
+  applyPatch?(patch: PersistedCachePatch): Promise<void>;
 }
 
 /**
@@ -43,6 +49,128 @@ function withPersistenceLock(
     if (persistenceLocks.get(adapter) === tail) persistenceLocks.delete(adapter);
   });
   return result;
+}
+
+/**
+ * A single field-level change detected between two cached values.
+ *
+ * `path` is a dotted path into the value (array indices are numeric segments,
+ * e.g. `beneficiaries.0.amount`). `previous` is `undefined` for added fields
+ * and `next` is `undefined` for removed fields.
+ */
+export interface CacheFieldChange {
+  path: string;
+  previous: unknown;
+  next: unknown;
+}
+
+/** Result of {@link diffCacheValues}. */
+export interface CacheValueDiff {
+  /** `true` when at least one field differs. */
+  changed: boolean;
+  /** Field-level changes, in stable key order. */
+  changes: CacheFieldChange[];
+  /** Dotted paths of the changed fields (convenience for `changes.map(c => c.path)`). */
+  changedPaths: string[];
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    !(value instanceof Date)
+  );
+}
+
+function collectFieldChanges(
+  previous: unknown,
+  next: unknown,
+  prefix: string,
+  changes: CacheFieldChange[],
+): void {
+  if (isPlainObject(previous) && isPlainObject(next)) {
+    const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
+    for (const key of Array.from(keys).sort()) {
+      collectFieldChanges(previous[key], next[key], prefix ? `${prefix}.${key}` : key, changes);
+    }
+    return;
+  }
+
+  if (Array.isArray(previous) && Array.isArray(next)) {
+    const length = Math.max(previous.length, next.length);
+    for (let index = 0; index < length; index += 1) {
+      collectFieldChanges(previous[index], next[index], `${prefix}.${index}`, changes);
+    }
+    return;
+  }
+
+  if (stableStringify(previous) !== stableStringify(next)) {
+    changes.push({ path: prefix, previous, next });
+  }
+}
+
+/**
+ * Computes the field-level difference between two cached values.
+ *
+ * Only changed fields are reported, so callers can apply incremental updates
+ * instead of replacing (and re-transferring) the whole value. Objects are
+ * compared key by key, arrays element by element, and `Date`/`bigint` values
+ * are compared structurally.
+ */
+export function diffCacheValues(previous: unknown, next: unknown): CacheValueDiff {
+  const changes: CacheFieldChange[] = [];
+  collectFieldChanges(previous, next, '', changes);
+  return {
+    changed: changes.length > 0,
+    changes,
+    changedPaths: changes.map((change) => change.path),
+  };
+}
+
+/**
+ * Applies a set of field-level changes to `base`, returning a new value.
+ * Fields whose `next` is `undefined` are removed. The input is not mutated.
+ */
+export function applyCacheFieldChanges<T>(base: T, changes: readonly CacheFieldChange[]): T {
+  if (changes.length === 0) {
+    return base;
+  }
+  const root: unknown = structuredCloneSafe(base);
+  for (const change of changes) {
+    const segments = change.path.split('.');
+    let target: Record<string, unknown> | unknown[] = root as Record<string, unknown>;
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      const segment = segments[index]!;
+      const container = target as Record<string, unknown>;
+      if (container[segment] === undefined || container[segment] === null) {
+        container[segment] = /^\d+$/.test(segments[index + 1]!) ? [] : {};
+      }
+      target = container[segment] as Record<string, unknown>;
+    }
+    const last = segments[segments.length - 1]!;
+    if (change.next === undefined) {
+      if (Array.isArray(target)) {
+        target.splice(Number(last), 1);
+      } else {
+        delete (target as Record<string, unknown>)[last];
+      }
+    } else {
+      (target as Record<string, unknown>)[last] = change.next;
+    }
+  }
+  return root as T;
+}
+
+function structuredCloneSafe<T>(value: T): T {
+  if (typeof structuredClone === 'function') {
+    try {
+      return structuredClone(value);
+    } catch {
+      // Fall through to the JSON round-trip for values structuredClone rejects.
+    }
+  }
+  return deserializeCacheValue<T>(serializeCacheValue(value));
 }
 
 export interface CacheGetResult<T> {
@@ -114,6 +242,32 @@ export interface ReadCacheOptions {
    * fails). When `false`, only the `onPersistenceFailure` callback is invoked.
    */
   rollbackOnPersistenceFailure?: boolean;
+  /**
+   * When `true`, {@link ReadCache.set} compares the incoming value with the
+   * cached one and only persists the changed fields (as a differential patch)
+   * instead of rewriting the whole entry. Unchanged writes are skipped
+   * entirely, which reduces persistence bandwidth. Defaults to `false`.
+   */
+  differentialSync?: boolean;
+}
+
+/** A persisted field-level patch produced by differential sync. */
+export interface PersistedCachePatch {
+  key: string;
+  /** Field-level changes relative to the previously persisted value. */
+  changes: CacheFieldChange[];
+  expiresAt: number | null;
+  willIds: string[];
+}
+
+/** Result of a differential {@link ReadCache.set}. */
+export interface DifferentialSetResult {
+  /** `true` when the value differed from the cached one. */
+  changed: boolean;
+  /** Dotted paths of the fields that changed (empty when unchanged). */
+  changedPaths: string[];
+  /** `true` when a persistence write was issued. */
+  persisted: boolean;
 }
 
 /** Performance metrics returned by {@link ReadCache.getCacheStats}. */
@@ -323,6 +477,7 @@ export class ReadCache {
   private readonly maxEntries: number;
   private readonly onPersistenceFailure: ((key: string, error: unknown) => void) | undefined;
   private readonly rollbackOnPersistenceFailure: boolean;
+  private readonly differentialSync: boolean;
   private readonly readyPromise: Promise<void>;
   /**
    * Will-ID to cache-key index. Maps each will ID to the set of cache keys
@@ -385,6 +540,7 @@ export class ReadCache {
     this.maxEntries = options.maxEntries ?? DEFAULT_MAX_CACHE_ENTRIES;
     this.onPersistenceFailure = options.onPersistenceFailure;
     this.rollbackOnPersistenceFailure = options.rollbackOnPersistenceFailure ?? false;
+    this.differentialSync = options.differentialSync ?? false;
 
     if (!this.checkOnline()) {
       this.offlineSince = this.now();
@@ -672,7 +828,7 @@ export class ReadCache {
           );
         });
       }
-      return;
+      return false;
     }
 
     // Serialize immediately to snapshot the object state, then deserialize
@@ -689,7 +845,6 @@ export class ReadCache {
 
     this.touchedKeys.add(key);
     // Clean up any stale willId -> key mappings if this key is being overwritten.
-    const previousEntry = this.entries.get(key);
     if (previousEntry) {
       for (const oldWillId of previousEntry.willIds) {
         if (!entry.willIds.has(oldWillId)) {
@@ -720,9 +875,24 @@ export class ReadCache {
         expiresAt: entry.expiresAt,
         willIds: Array.from(entry.willIds),
       };
+      // Differential sync: persist only the changed fields as a patch when the
+      // adapter supports it, so bandwidth scales with the change, not the value.
+      const patch: PersistedCachePatch | undefined =
+        this.differentialSync && previousEntry && changes.length > 0
+          ? {
+              key: entry.key,
+              changes,
+              expiresAt: entry.expiresAt,
+              willIds: Array.from(entry.willIds),
+            }
+          : undefined;
       void withPersistenceLock(this.persistence, async () => {
         try {
-          await this.persistence!.write(persistedEntry);
+          if (patch && typeof this.persistence!.applyPatch === 'function') {
+            await this.persistence!.applyPatch(patch);
+          } else {
+            await this.persistence!.write(persistedEntry);
+          }
         } catch (err) {
           // Report persistence failure via callback if provided
           this.onPersistenceFailure?.(key, err);
@@ -737,6 +907,7 @@ export class ReadCache {
     }
 
     this.evictIfNeeded();
+    return true;
   }
 
   /**
@@ -1015,6 +1186,22 @@ export class MemoryCachePersistenceAdapter implements CachePersistenceAdapter {
   async clear(): Promise<void> {
     this.entries = [];
   }
+
+  async applyPatch(patch: PersistedCachePatch): Promise<void> {
+    const index = this.entries.findIndex((e) => e.key === patch.key);
+    if (index < 0) {
+      return;
+    }
+    const existing = this.entries[index]!;
+    this.entries[index] = {
+      key: patch.key,
+      value: serializeCacheValue(
+        applyCacheFieldChanges(deserializeCacheValue(existing.value), patch.changes),
+      ),
+      expiresAt: patch.expiresAt,
+      willIds: patch.willIds,
+    };
+  }
 }
 
 /**
@@ -1082,6 +1269,30 @@ export class LocalStorageCachePersistenceAdapter implements CachePersistenceAdap
         localStorage.removeItem(this.namespace);
       } catch {
         // Silently fail if localStorage is unavailable
+      }
+    });
+  }
+
+  async applyPatch(patch: PersistedCachePatch): Promise<void> {
+    return this.withLock(async () => {
+      try {
+        const entries = await this.readAll();
+        const index = entries.findIndex((e) => e.key === patch.key);
+        if (index < 0) {
+          return;
+        }
+        const existing = entries[index]!;
+        entries[index] = {
+          key: patch.key,
+          value: serializeCacheValue(
+            applyCacheFieldChanges(deserializeCacheValue(existing.value), patch.changes),
+          ),
+          expiresAt: patch.expiresAt,
+          willIds: patch.willIds,
+        };
+        localStorage.setItem(this.namespace, JSON.stringify(entries));
+      } catch {
+        // Silently fail if localStorage is unavailable or quota exceeded
       }
     });
   }
@@ -1258,6 +1469,29 @@ export class IndexedDbCachePersistenceAdapter implements CachePersistenceAdapter
   async clear(): Promise<void> {
     try {
       await this.request('readwrite', (store) => store.clear());
+    } catch {
+      // Silently fail if IndexedDB is unavailable
+    }
+  }
+
+  async applyPatch(patch: PersistedCachePatch): Promise<void> {
+    try {
+      const existing = await this.request<PersistedCacheEntry | undefined>(
+        'readonly',
+        (store) => store.get(patch.key),
+      );
+      if (!existing) {
+        return;
+      }
+      const updated: PersistedCacheEntry = {
+        key: patch.key,
+        value: serializeCacheValue(
+          applyCacheFieldChanges(deserializeCacheValue(existing.value), patch.changes),
+        ),
+        expiresAt: patch.expiresAt,
+        willIds: patch.willIds,
+      };
+      await this.write(updated);
     } catch {
       // Silently fail if IndexedDB is unavailable
     }

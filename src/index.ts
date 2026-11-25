@@ -209,16 +209,20 @@ export {
   LocalStorageCachePersistenceAdapter,
   MemoryCachePersistenceAdapter,
   ReadCache,
+  applyCacheFieldChanges,
   createReadCacheKey,
+  diffCacheValues,
   escapeCacheKeyComponent,
   escapeKeyComponent,
 } from './cache';
 export type {
+  CacheFieldChange,
   CacheGetResult,
   CachePersistenceAdapter,
   CacheQueryOptions,
   CacheStrategy,
   PersistedCacheEntry,
+  PersistedCachePatch,
   ReadCacheOptions,
 } from './cache';
 
@@ -313,6 +317,7 @@ export {
   TooManyIdsError,
   TooManyWillsError,
   TransactionNetworkMismatchError,
+  TransactionNotFoundError,
   TransactionSubmissionError,
   WalletConnectChainIdMismatchError,
   WalletNetworkMismatchError,
