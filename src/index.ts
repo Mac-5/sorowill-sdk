@@ -136,6 +136,16 @@ export { DEFAULT_WILL_STREAM_CHUNK_SIZE } from './types';
 export type { WillStreamOptions } from './types';
 
 export {
+  WILL_STATES,
+  WILL_STATE_TRANSITIONS,
+  assertValidWillTransition,
+  canTransitionWill,
+  getValidNextStates,
+  isTerminalWillState,
+  isWillState,
+} from './willStateMachine';
+
+export {
   DEFAULT_FREIGHTER_CONNECT_TIMEOUT_MS,
   DEFAULT_MULTISIG_SIGNER_TIMEOUT_MS,
   FreighterWalletAdapter,
@@ -310,6 +320,7 @@ export {
   WalletCancelledError,
   isUserCancellationError,
   HookReturnValueError,
+  InvalidWillStateTransitionError,
   SameWillIdError,
   SignTransactionTimeoutError,
   SimulationError,
@@ -414,6 +425,8 @@ export {
   formatDeadline,
   formatTokenAmount,
   formatUSDC,
+  generateDeterministicTransactionId,
+  deriveTransactionId,
   getNextActionableState,
   getStellarAddressError,
   getTimeUntilCheckin,
@@ -429,7 +442,7 @@ export {
   validateGuardians,
   validateGuardianSignature,
 } from './utils';
-export type { NextActionableState } from './utils';
+export type { DeterministicTransactionIdInput, NextActionableState } from './utils';
 
 export {
   isBeneficiaryWhitelisted,
