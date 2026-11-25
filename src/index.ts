@@ -16,8 +16,15 @@ export {
   buildContractInstanceLedgerKey,
 } from './SoroWillClient';
 export { MAX_CHECKIN_PERIOD_DAYS } from './SoroWillClient';
+export {
+  MAX_CHECKIN_PERIOD_YEARS,
+  getMaxCheckinPeriodDate,
+  validateCheckinPeriodDate,
+  validateCheckinPeriodDaysHorizon,
+} from './validation';
 export type {
   ContractStorageDurability,
+  MinimumWillBalance,
   EventSubscription,
   EventSubscriptionOptions,
   EventSubscriptionTransport,
@@ -27,6 +34,7 @@ export type {
   SoroWillNetwork,
   SoroWillRpcServer,
   SoroWillReadCacheOptions,
+  SignedTransactionResult,
 } from './SoroWillClient';
 export { DEFAULT_CONTRACT_IDS } from './SoroWillClient';
 export {
@@ -56,10 +64,18 @@ export type {
   MultisigCollectorOptions,
 } from './multisig';
 
-export {
+    export {
   buildFeeBumpXdr,
+  clampFeeToBounds,
+  computeNetworkFeeLoad,
   estimateFeeBumpFee,
+  estimateSmartFee,
   isFeeEstimateStale,
+  resolveFeeEstimationBounds,
+  DEFAULT_CONGESTION_LOAD_RATIO,
+  DEFAULT_CONGESTION_MULTIPLIER,
+  DEFAULT_MAX_ESTIMATED_FEE,
+  DEFAULT_MIN_ESTIMATED_FEE,
   refreshFeeEstimateIfStale,
   DEFAULT_FEE_STALENESS_THRESHOLD_MS,
   signFeeBumpXdr,
@@ -69,17 +85,25 @@ export {
   StaleTransactionSequenceError,
 } from './feeBump';
 export type {
+  ComputeTransactionCostBreakdownOptions,
   EstimateFeeBumpFeeOptions,
+  EstimateSmartFeeOptions,
   FeeBumpOptions,
   FeeEstimate,
+  FeeEstimationBounds,
+  NetworkFeeLoad,
   SubmitFeeBumpOptions,
+  TransactionCostBreakdown,
 } from './feeBump';
 
 export {
   SimulationResultError,
   UnsupportedSignatureAlgorithmError,
+  NetworkMismatchError,
   assertSupportedSignatureAlgorithm,
   assertSignedTransactionXdrSignatures,
+  assertTransactionNetwork,
+  computeNetworkId,
   ED25519_SIGNATURE_LENGTH,
 } from './txValidation';
 export type {
@@ -107,8 +131,23 @@ export type {
   SorobanEventType,
   UpdateBeneficiariesParams,
   Will,
+  WillAccessControlInfo,
+  WillAccessEntry,
+  WillAccessType,
 } from './types';
 export { SOROBAN_EVENT_TYPES, WillStatus, WillErrorCode } from './types';
+export { DEFAULT_WILL_STREAM_CHUNK_SIZE } from './types';
+export type { WillStreamOptions } from './types';
+
+export {
+  WILL_STATES,
+  WILL_STATE_TRANSITIONS,
+  assertValidWillTransition,
+  canTransitionWill,
+  getValidNextStates,
+  isTerminalWillState,
+  isWillState,
+} from './willStateMachine';
 
 export { compareWills } from './willComparison';
 export type {
@@ -120,7 +159,9 @@ export type {
 
 export {
   DEFAULT_FREIGHTER_CONNECT_TIMEOUT_MS,
+  DEFAULT_MULTISIG_SIGNER_TIMEOUT_MS,
   FreighterWalletAdapter,
+  MultisigWalletAdapter,
   WalletSessionError,
   assertWalletSessionActive,
   connectWallet,
@@ -138,12 +179,37 @@ export {
   validateWalletSessionToken,
 } from './wallet';
 export type {
+  MultisigSigner,
+  MultisigSignerResult,
+  MultisigSignResult,
+  MultisigWalletAdapterOptions,
   WalletAdapter,
   WalletAdapterError,
   WalletConnection,
   WalletSession,
   WalletSessionOptions,
 } from './wallet';
+
+export {
+  DEFAULT_WEBHOOK_MAX_ATTEMPTS,
+  DEFAULT_WEBHOOK_MAX_RETRY_DELAY_MS,
+  DEFAULT_WEBHOOK_RETRY_BASE_DELAY_MS,
+  DEFAULT_WEBHOOK_TIMEOUT_MS,
+  InvalidWebhookUrlError,
+  WEBHOOK_ATTEMPT_HEADER,
+  WEBHOOK_DELIVERY_ID_HEADER,
+  WEBHOOK_SIGNATURE_HEADER,
+  WebhookDeliveryError,
+  WebhookManager,
+  computeWebhookSignature,
+  verifyWebhookSignature,
+} from './webhooks';
+export type {
+  WebhookDeliveryResult,
+  WebhookManagerOptions,
+  WebhookPayload,
+  WebhookRegistration,
+} from './webhooks';
 
 export { createAlbedoAdapter } from './adapters/albedo';
 export type { AlbedoAdapterOptions } from './adapters/albedo';
@@ -165,18 +231,27 @@ export type {
 } from './walletConnect';
 
 export {
+  DEFAULT_CACHE_CHANNEL_NAME,
+  DEFAULT_CROSS_TAB_POLL_INTERVAL_MS,
+  DEFAULT_CROSS_TAB_TIMEOUT_MS,
   IndexedDbCachePersistenceAdapter,
   LocalStorageCachePersistenceAdapter,
   MemoryCachePersistenceAdapter,
   ReadCache,
+  applyCacheFieldChanges,
   createReadCacheKey,
+  diffCacheValues,
   escapeCacheKeyComponent,
   escapeKeyComponent,
 } from './cache';
 export type {
+  CacheFieldChange,
   CacheGetResult,
   CachePersistenceAdapter,
+  CacheQueryOptions,
+  CacheStrategy,
   PersistedCacheEntry,
+  PersistedCachePatch,
   ReadCacheOptions,
 } from './cache';
 
@@ -204,6 +279,7 @@ export {
   AlreadyVotedError,
   BatchNetworkMismatchError,
   BeneficiaryNotFoundError,
+  BeneficiaryNotWhitelistedError,
   BeneficiaryValidationError,
   CheckinNotDueError,
   CheckinPeriodExceedsTtlError,
@@ -259,9 +335,11 @@ export {
   WalletCancelledError,
   isUserCancellationError,
   HookReturnValueError,
+  InvalidWillStateTransitionError,
   SameWillIdError,
   SignTransactionTimeoutError,
   SimulationError,
+  SoroWillConfigError,
   SoroWillError,
   SoroWillInvalidAmountError,
   SoroWillRestoreRequiredError,
@@ -270,12 +348,14 @@ export {
   TooManyIdsError,
   TooManyWillsError,
   TransactionNetworkMismatchError,
+  TransactionNotFoundError,
   TransactionSubmissionError,
   WalletConnectChainIdMismatchError,
   WalletNetworkMismatchError,
   CheckInDuringGracePeriodError,
   GracePeriodExceedsCheckinPeriodError,
   WebSocketNotConfiguredError,
+  SseNotConfiguredError,
   WillContractError,
   WillNotActiveError,
   WillNotBothActiveError,
@@ -302,15 +382,30 @@ export {
   DEFAULT_MAX_QUEUE_SIZE,
   RequestQueue,
   RequestPriority,
+  DEFAULT_PRIORITIES,
   getSharedRequestQueue,
   releaseSharedRequestQueue,
   computeBackoffDelay,
   classifyRpcError,
   isRateLimitError,
   MAX_BACKOFF_MS,
+  DEFAULT_JITTER_RANGE,
   ErrorTransience,
 } from './requestQueue';
-export type { RequestQueueMetrics, RequestQueueOptions } from './requestQueue';
+export type {
+  BackoffJitterRange,
+  RequestQueueMetrics,
+  RequestQueueOptions,
+} from './requestQueue';
+
+export { MetricsCollector, MetricsReporter } from './metrics';
+export type {
+  AggregatedMetrics,
+  AnalyticsSnapshot,
+  MetricsReporterOptions,
+  OperationCounters,
+  OperationMetrics,
+} from './metrics';
 
 export { DebugLogger, DEFAULT_REDACTED_KEYS, REDACTED } from './debugLogger';
 export type { DebugLoggerOptions } from './debugLogger';
@@ -345,6 +440,8 @@ export {
   formatDeadline,
   formatTokenAmount,
   formatUSDC,
+  generateDeterministicTransactionId,
+  deriveTransactionId,
   getNextActionableState,
   getStellarAddressError,
   getTimeUntilCheckin,
@@ -360,7 +457,14 @@ export {
   validateGuardians,
   validateGuardianSignature,
 } from './utils';
-export type { NextActionableState } from './utils';
+export type { DeterministicTransactionIdInput, NextActionableState } from './utils';
+
+export {
+  isBeneficiaryWhitelisted,
+  validateBeneficiariesAgainstWhitelist,
+  validateBeneficiaryWhitelist,
+} from './validation';
+export type { BeneficiaryWhitelistOptions } from './validation';
 
 export {
   DistributionAllocationError,
@@ -406,3 +510,18 @@ export {
   isWillStatus,
 } from './typeGuards';
 export type { RpcTransaction } from './typeGuards';
+
+export {
+  CERTIFICATE_FORMAT_VERSION,
+  buildWillCertificate,
+  computeWillCertificateProof,
+  renderWillCertificatePdf,
+  verifyWillCertificate,
+} from './certificate';
+export type {
+  BuildWillCertificateOptions,
+  WillCertificate,
+  WillCertificateBeneficiary,
+  WillCertificateProof,
+  WillCertificateVerification,
+} from './certificate';

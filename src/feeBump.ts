@@ -1,4 +1,5 @@
 import {
+  FeeBumpTransaction,
   Keypair,
   Transaction,
   TransactionBuilder,
@@ -53,6 +54,151 @@ export interface EstimateFeeBumpFeeOptions {
   innerTransactionXdr: string;
   /** Optional RPC server to use instead of the network's configured endpoints (e.g. for tests). */
   rpcServer?: SoroWillRpcServer;
+  /**
+   * Optional bounds applied to the dynamically estimated fee. The estimate is
+   * clamped to `[minFee, maxFee]` (in stroops) after network-load adjustment.
+   */
+  bounds?: FeeEstimationBounds;
+}
+
+/**
+ * Configurable bounds for smart fee estimation, in stroops.
+ *
+ * - `minFee` — never bid below this per-operation fee (defaults to {@link BASE_FEE}).
+ * - `maxFee` — never bid above this per-operation fee (defaults to
+ *   {@link DEFAULT_MAX_FEE_MULTIPLIER} × {@link BASE_FEE}).
+ */
+export interface FeeEstimationBounds {
+  /** Minimum per-operation fee in stroops. */
+  minFee?: string | number | bigint;
+  /** Maximum per-operation fee in stroops. */
+  maxFee?: string | number | bigint;
+}
+
+/** Default lower bound for smart fee estimation, in stroops. */
+export const DEFAULT_MIN_ESTIMATED_FEE = BASE_FEE;
+
+/** Default upper bound for smart fee estimation, in stroops. */
+export const DEFAULT_MAX_ESTIMATED_FEE = String(
+  BigInt(BASE_FEE) * BigInt(DEFAULT_MAX_FEE_MULTIPLIER),
+);
+
+/** A snapshot of network fee load used to adjust fee estimates. */
+export interface NetworkFeeLoad {
+  /** p90 Soroban inclusion fee reported by the network, in stroops. */
+  sorobanInclusionFeeP90: string;
+  /** p90 classic inclusion fee reported by the network, in stroops. */
+  inclusionFeeP90: string;
+  /** Ratio of the p90 to the p50 Soroban inclusion fee (1 when unknown). */
+  loadRatio: number;
+  /** Whether the network is considered congested (load ratio above the threshold). */
+  congested: boolean;
+}
+
+/** Options for {@link estimateSmartFee}. */
+export interface EstimateSmartFeeOptions extends EstimateFeeBumpFeeOptions {
+  /**
+   * Load ratio (p90 / p50) above which the estimate is scaled up as
+   * congested. Defaults to {@link DEFAULT_CONGESTION_LOAD_RATIO}.
+   */
+  congestionLoadRatio?: number;
+  /**
+   * Multiplier applied to the p90 baseline when the network is congested.
+   * Defaults to {@link DEFAULT_CONGESTION_MULTIPLIER}.
+   */
+  congestionMultiplier?: number;
+}
+
+/** Default p90/p50 ratio above which the network is treated as congested. */
+export const DEFAULT_CONGESTION_LOAD_RATIO = 2;
+
+/** Default multiplier applied to the p90 baseline under congestion. */
+export const DEFAULT_CONGESTION_MULTIPLIER = 1.5;
+
+/** Resolves configurable fee bounds, validating and ordering them. */
+export function resolveFeeEstimationBounds(bounds: FeeEstimationBounds = {}): {
+  minFee: bigint;
+  maxFee: bigint;
+} {
+  const minFee =
+    bounds.minFee === undefined ? BigInt(DEFAULT_MIN_ESTIMATED_FEE) : BigInt(bounds.minFee);
+  const maxFee =
+    bounds.maxFee === undefined ? BigInt(DEFAULT_MAX_ESTIMATED_FEE) : BigInt(bounds.maxFee);
+  if (minFee < 0n || maxFee < 0n) {
+    throw new SoroWillError('Fee estimation bounds must be non-negative');
+  }
+  if (minFee > maxFee) {
+    throw new SoroWillError('Fee estimation minFee must not exceed maxFee');
+  }
+  return { minFee, maxFee };
+}
+
+/** Clamps `fee` to the given inclusive bounds. */
+export function clampFeeToBounds(fee: bigint, bounds: FeeEstimationBounds = {}): bigint {
+  const { minFee, maxFee } = resolveFeeEstimationBounds(bounds);
+  if (fee < minFee) return minFee;
+  if (fee > maxFee) return maxFee;
+  return fee;
+}
+
+/**
+ * Derives the current network fee load from a `getFeeStats` response.
+ * The load ratio compares the p90 Soroban inclusion fee to the p50, so a
+ * congested network (where the top decile bids far above the median) is
+ * detected without hard-coding absolute fee values.
+ */
+export function computeNetworkFeeLoad(
+  stats: rpc.Api.GetFeeStatsResponse,
+  congestionLoadRatio: number = DEFAULT_CONGESTION_LOAD_RATIO,
+): NetworkFeeLoad {
+  const p90 = BigInt(stats.sorobanInclusionFee.p90);
+  const p50 = BigInt(stats.sorobanInclusionFee.p50);
+  const loadRatio = p50 > 0n ? Number(p90) / Number(p50) : 1;
+  return {
+    sorobanInclusionFeeP90: p90.toString(),
+    inclusionFeeP90: BigInt(stats.inclusionFee.p90).toString(),
+    loadRatio,
+    congested: loadRatio >= congestionLoadRatio,
+  };
+}
+
+/**
+ * Estimate a per-operation fee that adapts to current network load.
+ *
+ * The estimate starts from the network's p90 Soroban inclusion fee, is scaled
+ * up by `congestionMultiplier` when the network is congested, is never lower
+ * than the inner transaction's own per-operation inclusion fee, and is finally
+ * clamped to the configurable `bounds`.
+ *
+ * @throws {SoroWillError} If the RPC server does not support `getFeeStats`.
+ */
+export async function estimateSmartFee(options: EstimateSmartFeeOptions): Promise<FeeEstimate> {
+  const config = NETWORK_CONFIG[options.network];
+  const pool = new RpcEndpointPool(config.rpcUrls, options.rpcServer);
+
+  const innerTx = TransactionBuilder.fromXDR(
+    options.innerTransactionXdr,
+    config.networkPassphrase,
+  ) as Transaction;
+
+  const stats = await pool.withFailover((server) => {
+    if (typeof server.getFeeStats !== 'function') {
+      throw new SoroWillError('The configured RPC server does not support getFeeStats');
+    }
+    return server.getFeeStats();
+  });
+
+  const load = computeNetworkFeeLoad(stats, options.congestionLoadRatio);
+  const multiplier = options.congestionMultiplier ?? DEFAULT_CONGESTION_MULTIPLIER;
+
+  let fee = BigInt(load.sorobanInclusionFeeP90);
+  if (load.congested && multiplier > 1) {
+    fee = BigInt(Math.ceil(Number(fee) * multiplier));
+  }
+  const innerPerOp = getInnerInclusionFeePerOp(innerTx);
+  if (fee < innerPerOp) fee = innerPerOp;
+
+  return { fee: clampFeeToBounds(fee, options.bounds).toString(), estimatedAt: Date.now() };
 }
 
 /**
@@ -172,6 +318,53 @@ export function estimateBatchFee(invocationCount: number, baseFee: number = 100)
   return String(count * perOp);
 }
 
+/**
+ * A breakdown of a transaction's total fee into its components, all in stroops
+ * (1 XLM = 10,000,000 stroops).
+ *
+ * Stellar charges a transaction fee made up of three parts:
+ *
+ * - **Base fees** (`baseFee`): the network minimum fee per operation
+ *   ({@link BASE_FEE}, 100 stroops) multiplied by the number of operations.
+ *   This is the floor every transaction pays for inclusion.
+ * - **Priority fees** (`priorityFee`): the per-operation bid above the base fee
+ *   that a transaction offers to outbid others for inclusion in a ledger. It is
+ *   `(inclusionFeePerOp - baseFeePerOp) * operationCount` and is zero when the
+ *   transaction bids only the network minimum.
+ * - **Resource fees** (`resourceFee`): the Soroban fee for CPU instructions,
+ *   ledger reads/writes and events, taken from the transaction's Soroban
+ *   transaction data. It is zero for non-Soroban transactions.
+ *
+ * `totalFee` is the sum of the three components and equals the transaction's
+ * declared fee.
+ */
+export interface TransactionCostBreakdown {
+  /** Total fee in stroops (`baseFee + priorityFee + resourceFee`). */
+  totalFee: string;
+  /** Base fees in stroops: {@link BASE_FEE} times the operation count. */
+  baseFee: string;
+  /** Priority fees in stroops: the per-operation bid above the base fee, times the operation count. */
+  priorityFee: string;
+  /** Soroban resource fee in stroops (0 for non-Soroban transactions). */
+  resourceFee: string;
+  /** The network minimum base fee per operation, in stroops. */
+  baseFeePerOp: string;
+  /** The inclusion fee per operation actually bid, in stroops. */
+  inclusionFeePerOp: string;
+  /** Number of operations in the transaction. */
+  operationCount: number;
+}
+
+/** Options for {@link computeTransactionCostBreakdown}. */
+export interface ComputeTransactionCostBreakdownOptions {
+  /** The network the transaction is built for. */
+  network: SoroWillNetwork;
+  /** The base64-encoded XDR of the transaction (or fee-bump transaction). */
+  transactionXdr: string;
+  /** Base fee per operation in stroops. Defaults to {@link BASE_FEE}. */
+  baseFeePerOp?: string;
+}
+
 /** Returns the inner transaction's per-operation inclusion fee (its fee minus any Soroban resource fee). */
 function getInnerInclusionFeePerOp(innerTx: Transaction): bigint {
   let resourceFee = 0n;
@@ -184,6 +377,64 @@ function getInnerInclusionFeePerOp(innerTx: Transaction): bigint {
   const ops = BigInt(Math.max(innerTx.operations.length, 1));
   const perOp = (BigInt(innerTx.fee) - resourceFee + ops - 1n) / ops;
   return perOp > 0n ? perOp : 0n;
+}
+
+/**
+ * Break a transaction's total fee down into base fees, priority fees and
+ * Soroban resource fees (see {@link TransactionCostBreakdown}).
+ *
+ * The transaction's declared fee is split as follows: the Soroban resource fee
+ * is read from the transaction's Soroban data, the remainder is the inclusion
+ * fee, of which `baseFeePerOp * operationCount` is base fees and anything above
+ * that is the priority fee. For fee-bump transactions the inner transaction's
+ * fee is broken down.
+ *
+ * @throws {SoroWillError} If the XDR cannot be parsed as a transaction.
+ */
+export function computeTransactionCostBreakdown(
+  options: ComputeTransactionCostBreakdownOptions,
+): TransactionCostBreakdown {
+  const config = NETWORK_CONFIG[options.network];
+  let parsed: Transaction | FeeBumpTransaction;
+  try {
+    parsed = TransactionBuilder.fromXDR(options.transactionXdr, config.networkPassphrase) as
+      | Transaction
+      | FeeBumpTransaction;
+  } catch (error) {
+    throw new SoroWillError('Unable to parse transaction XDR for cost breakdown', {
+      cause: error,
+    });
+  }
+
+  const innerTx = 'innerTransaction' in parsed ? parsed.innerTransaction : parsed;
+  const operationCount = Math.max(innerTx.operations.length, 1);
+  const ops = BigInt(operationCount);
+
+  let resourceFee = 0n;
+  try {
+    const ext = innerTx.toEnvelope().v1().tx().ext();
+    if (ext.switch() === 1) resourceFee = BigInt(ext.sorobanData().resourceFee().toString());
+  } catch {
+    resourceFee = 0n;
+  }
+
+  const totalFee = BigInt(innerTx.fee);
+  const inclusionFee = totalFee > resourceFee ? totalFee - resourceFee : 0n;
+  const inclusionFeePerOp = (inclusionFee + ops - 1n) / ops;
+
+  const baseFeePerOp = BigInt(options.baseFeePerOp ?? BASE_FEE);
+  const baseFee = baseFeePerOp * ops;
+  const priorityFee = inclusionFee > baseFee ? inclusionFee - baseFee : 0n;
+
+  return {
+    totalFee: totalFee.toString(),
+    baseFee: baseFee.toString(),
+    priorityFee: priorityFee.toString(),
+    resourceFee: resourceFee.toString(),
+    baseFeePerOp: baseFeePerOp.toString(),
+    inclusionFeePerOp: inclusionFeePerOp.toString(),
+    operationCount,
+  };
 }
 
 /**
