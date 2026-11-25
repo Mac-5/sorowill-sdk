@@ -62,7 +62,7 @@ export type {
   MultisigCollectorOptions,
 } from './multisig';
 
-export {
+    export {
   buildFeeBumpXdr,
   clampFeeToBounds,
   computeNetworkFeeLoad,
@@ -83,6 +83,7 @@ export {
   StaleTransactionSequenceError,
 } from './feeBump';
 export type {
+  ComputeTransactionCostBreakdownOptions,
   EstimateFeeBumpFeeOptions,
   EstimateSmartFeeOptions,
   FeeBumpOptions,
@@ -90,6 +91,7 @@ export type {
   FeeEstimationBounds,
   NetworkFeeLoad,
   SubmitFeeBumpOptions,
+  TransactionCostBreakdown,
 } from './feeBump';
 
 export {
@@ -219,6 +221,9 @@ export type {
 } from './walletConnect';
 
 export {
+  DEFAULT_CACHE_CHANNEL_NAME,
+  DEFAULT_CROSS_TAB_POLL_INTERVAL_MS,
+  DEFAULT_CROSS_TAB_TIMEOUT_MS,
   IndexedDbCachePersistenceAdapter,
   LocalStorageCachePersistenceAdapter,
   MemoryCachePersistenceAdapter,
@@ -471,3 +476,18 @@ export {
   isWillStatus,
 } from './typeGuards';
 export type { RpcTransaction } from './typeGuards';
+
+export {
+  CERTIFICATE_FORMAT_VERSION,
+  buildWillCertificate,
+  computeWillCertificateProof,
+  renderWillCertificatePdf,
+  verifyWillCertificate,
+} from './certificate';
+export type {
+  BuildWillCertificateOptions,
+  WillCertificate,
+  WillCertificateBeneficiary,
+  WillCertificateProof,
+  WillCertificateVerification,
+} from './certificate';

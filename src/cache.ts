@@ -508,6 +508,21 @@ export class ReadCache {
   private hits = 0;
   private misses = 0;
   private evictions = 0;
+  /** Cross-tab deduplication state (only populated when `crossTab` is enabled). */
+  private readonly crossTabChannel: CrossTabChannel | undefined;
+  private readonly crossTabTabId = createTabId();
+  private readonly crossTabPollIntervalMs: number;
+  private readonly crossTabTimeoutMs: number;
+  /** Requests this tab is currently fetching, keyed by cache key. */
+  private readonly crossTabPending = new Map<string, string>();
+  /** Requests other tabs are fetching, keyed by cache key. */
+  private readonly crossTabRemotePending = new Map<string, string>();
+  /** Waiters for a response from another tab, keyed by request id. */
+  private readonly crossTabWaiters = new Map<
+    string,
+    { resolve: (message: CrossTabCacheMessage) => void; timer: ReturnType<typeof setTimeout> }
+  >();
+  private crossTabPollTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(options: ReadCacheOptions = {}) {
     const ttlMs = options.ttlMs ?? 60_000;
@@ -542,6 +557,25 @@ export class ReadCache {
     this.rollbackOnPersistenceFailure = options.rollbackOnPersistenceFailure ?? false;
     this.differentialSync = options.differentialSync ?? false;
 
+    this.crossTabPollIntervalMs =
+      options.crossTabPollIntervalMs ?? DEFAULT_CROSS_TAB_POLL_INTERVAL_MS;
+    this.crossTabTimeoutMs = options.crossTabTimeoutMs ?? DEFAULT_CROSS_TAB_TIMEOUT_MS;
+    if (options.crossTab) {
+      const channelName =
+        typeof options.crossTab === 'string' ? options.crossTab : DEFAULT_CACHE_CHANNEL_NAME;
+      this.crossTabChannel = createCrossTabChannel(channelName);
+      if (this.crossTabChannel) {
+        this.crossTabChannel.onmessage = (event) => this.handleCrossTabMessage(event.data);
+      } else {
+        // No BroadcastChannel: poll the persistence adapter for shared responses.
+        this.crossTabPollTimer = setInterval(() => {
+          void this.pollCrossTabResponses();
+        }, this.crossTabPollIntervalMs);
+        // Do not keep a Node.js process alive just for polling.
+        (this.crossTabPollTimer as { unref?: () => void }).unref?.();
+      }
+    }
+
     if (!this.checkOnline()) {
       this.offlineSince = this.now();
     }
@@ -564,6 +598,20 @@ export class ReadCache {
 
   /** Removes browser online/offline event listeners registered by this cache. */
   destroy(): void {
+    if (this.crossTabPollTimer !== undefined) {
+      clearInterval(this.crossTabPollTimer);
+      this.crossTabPollTimer = undefined;
+    }
+    if (this.crossTabChannel) {
+      this.crossTabChannel.onmessage = null;
+      this.crossTabChannel.close();
+    }
+    for (const waiter of this.crossTabWaiters.values()) {
+      clearTimeout(waiter.timer);
+    }
+    this.crossTabWaiters.clear();
+    this.crossTabPending.clear();
+    this.crossTabRemotePending.clear();
     if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
       if (this.onOfflineHandler) {
         window.removeEventListener('offline', this.onOfflineHandler);
@@ -1057,6 +1105,9 @@ export class ReadCache {
       }
     }
     this.entries.delete(key);
+    if (this.crossTabChannel) {
+      this.broadcastCrossTab({ type: 'invalidate', key, tabId: this.crossTabTabId });
+    }
     if (this.persistence) {
       await withPersistenceLock(this.persistence, async () => {
         try {

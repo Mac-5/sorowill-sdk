@@ -15,6 +15,7 @@ export const SDK_REQUIRED_CONTRACT_METHODS: readonly string[] = [
   'get_wills_by_guardian',
   'get_wills_by_owner',
   'guardian_trigger',
+  'migrate_will',
   'release_inheritance',
   'top_up',
   'trigger_will',
