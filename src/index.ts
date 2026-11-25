@@ -23,6 +23,7 @@ export {
 } from './validation';
 export type {
   ContractStorageDurability,
+  MinimumWillBalance,
   EventSubscription,
   EventSubscriptionOptions,
   EventSubscriptionTransport,
@@ -358,9 +359,14 @@ export {
   classifyRpcError,
   isRateLimitError,
   MAX_BACKOFF_MS,
+  DEFAULT_JITTER_RANGE,
   ErrorTransience,
 } from './requestQueue';
-export type { RequestQueueMetrics, RequestQueueOptions } from './requestQueue';
+export type {
+  BackoffJitterRange,
+  RequestQueueMetrics,
+  RequestQueueOptions,
+} from './requestQueue';
 
 export { MetricsCollector, MetricsReporter } from './metrics';
 export type {
