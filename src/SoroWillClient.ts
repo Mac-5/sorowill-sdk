@@ -52,8 +52,9 @@ import type {
   SorobanEventType,
   UpdateBeneficiariesParams,
   Will,
+  WillStreamOptions,
 } from './types';
-import { WillStatus } from './types';
+import { DEFAULT_WILL_STREAM_CHUNK_SIZE, WillStatus } from './types';
 import {
   assertWalletSessionActive,
   getDefaultWalletAdapter,
@@ -105,6 +106,7 @@ import { HookManager } from './hooks';
 import type { BeforeInvokeContext, AfterInvokeContext } from './hooks';
 import { assertPreparedTransactionMatchesIntendedOperation, assertSupportedSignatureAlgorithm } from './txValidation';
 import { DebugLogger, type DebugLoggerOptions } from './debugLogger';
+import { SoroWillEventEmitter, type SoroWillLifecycleEvent } from './lifecycleEvents';
 
 /** @internal Local alias for Soroban's `xdr.ScVal`; not part of the public API. */
 type ScVal = xdr.ScVal;
@@ -633,6 +635,13 @@ export interface SoroWillClientOptions {
    * ```
    */
   readOnly?: boolean;
+  /**
+   * Optional lifecycle event emitter. When provided, the client emits
+   * `init`, `connect`, `disconnect`, and `error` events to its listeners
+   * (#786). A private emitter is created when omitted, so
+   * {@link SoroWillClient.on} always works.
+   */
+  events?: SoroWillEventEmitter;
 }
 
 /** The raw, snake_case shape of a `Will` as decoded straight off the contract spec. */
@@ -1574,6 +1583,86 @@ function assertBatchSize(length: number, method: string): void {
   }
 }
 
+/** A single beneficiary's previewed share of a will's distribution. */
+export interface BeneficiaryDistributionPreview {
+  /** The beneficiary's Stellar address. */
+  address: string;
+  /** The beneficiary's share, in percent (0-100), as stored on the will. */
+  percentage: number;
+  /** The beneficiary's final amount, in the token's smallest unit (stroops). */
+  amount: bigint;
+}
+
+/** Result of {@link SoroWillClient.previewDistribution}. */
+export interface DistributionPreview {
+  /** Total amount being distributed, in the token's smallest unit (stroops). */
+  totalAmount: bigint;
+  /** Per-beneficiary amounts, in the same order as the will's beneficiaries. */
+  distributions: BeneficiaryDistributionPreview[];
+  /** Sum of all previewed amounts; equals `totalAmount` (rounding remainder is assigned). */
+  distributedAmount: bigint;
+}
+
+/**
+ * Split `totalAmount` across beneficiaries by percentage, in integer units.
+ *
+ * Uses largest-remainder rounding so the parts always sum exactly to
+ * `totalAmount`: each share is floored, then the leftover units are handed out
+ * one at a time to the beneficiaries with the largest fractional remainders
+ * (ties broken by original order). Percentages are converted to basis points
+ * (×100) to match the on-chain representation.
+ */
+export function computeDistributionPreview(
+  totalAmount: bigint,
+  beneficiaries: ReadonlyArray<{ address: string; percentage: number }>,
+): DistributionPreview {
+  if (totalAmount < 0n) {
+    throw new RangeError('totalAmount must be non-negative');
+  }
+  const total = BigInt(totalAmount);
+  const basisPoints = beneficiaries.map((b) => BigInt(Math.round(b.percentage * 100)));
+  const totalBasisPoints = basisPoints.reduce((sum, bp) => sum + bp, 0n);
+
+  const amounts: bigint[] = [];
+  const remainders: { index: number; remainder: bigint }[] = [];
+  let distributed = 0n;
+
+  for (let i = 0; i < beneficiaries.length; i += 1) {
+    const bp = basisPoints[i] ?? 0n;
+    const numerator = total * bp;
+    const share = totalBasisPoints === 0n ? 0n : numerator / totalBasisPoints;
+    amounts.push(share);
+    distributed += share;
+    remainders.push({
+      index: i,
+      remainder: totalBasisPoints === 0n ? 0n : numerator % totalBasisPoints,
+    });
+  }
+
+  let leftover = total - distributed;
+  if (leftover > 0n) {
+    remainders.sort((a, b) => {
+      if (a.remainder === b.remainder) return a.index - b.index;
+      return a.remainder > b.remainder ? -1 : 1;
+    });
+    for (const { index } of remainders) {
+      if (leftover === 0n) break;
+      amounts[index] = (amounts[index] ?? 0n) + 1n;
+      leftover -= 1n;
+    }
+  }
+
+  return {
+    totalAmount: total,
+    distributions: beneficiaries.map((b, i) => ({
+      address: b.address,
+      percentage: b.percentage,
+      amount: amounts[i] ?? 0n,
+    })),
+    distributedAmount: amounts.reduce((sum, amount) => sum + amount, 0n),
+  };
+}
+
 export class SoroWillClient {
   private readonly server: SoroWillRpcServer;
   private readonly rpcPool: RpcEndpointPool;
@@ -1657,6 +1746,7 @@ export class SoroWillClient {
   private expectedContractVersion?: string | undefined;
   private warnedSpecVersions: Set<string> = new Set();
   private requireWalletNetwork: boolean = false;
+  private readonly lifecycleEvents: SoroWillEventEmitter;
 
   constructor(options: SoroWillClientOptions) {
     // Validate the whole configuration on initialization (#798, #626).
@@ -1696,6 +1786,7 @@ export class SoroWillClient {
         } as WalletAdapter)
       : (options.wallet ?? getDefaultWalletAdapter());
     this.requireWalletNetwork = options.requireWalletNetwork ?? false;
+    this.lifecycleEvents = options.events ?? new SoroWillEventEmitter();
     this.pollAttempts = options.pollAttempts ?? DEFAULT_POLL_ATTEMPTS;
     if (!Number.isInteger(this.pollAttempts) || this.pollAttempts <= 0) {
       throw new RangeError('pollAttempts must be a positive integer');
@@ -1812,6 +1903,49 @@ export class SoroWillClient {
         throw err;
       }
     }
+
+    this.lifecycleEvents.emit('init', {
+      network: this.network,
+      contractId: options.contractId,
+      readOnly: this.readOnly,
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // Lifecycle events (#786)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Registers a listener for SDK lifecycle events (`init`, `connect`,
+   * `disconnect`, `error`). Pass `'*'` to receive every event.
+   *
+   * @returns An unsubscribe function.
+   *
+   * @example
+   * ```ts
+   * const off = client.on('error', (event) => console.warn(event.type, event.error));
+   * // later
+   * off();
+   * ```
+   */
+  on(
+    type: SoroWillLifecycleEvent | '*',
+    listener: (event: SoroWillLifecycleEvent) => void,
+  ): () => void {
+    return this.lifecycleEvents.on(type, listener);
+  }
+
+  /** Removes a previously registered lifecycle listener. */
+  off(type: SoroWillLifecycleEvent | '*', listener: (event: SoroWillLifecycleEvent) => void): void {
+    this.lifecycleEvents.off(type, listener);
+  }
+
+  /** Registers a listener that fires at most once for the given event type. */
+  once(
+    type: SoroWillLifecycleEvent | '*',
+    listener: (event: SoroWillLifecycleEvent) => void,
+  ): () => void {
+    return this.lifecycleEvents.once(type, listener);
   }
 
   // -----------------------------------------------------------------------
@@ -2192,6 +2326,139 @@ export class SoroWillClient {
    * console.log(`Will triggered in transaction: ${txHash}`);
    * ```
    */
+  /**
+   * Cancels an unconfirmed (still pending) transaction by replacing it with a
+   * high-fee transaction that reuses the same source account and sequence
+   * number (#788).
+   *
+   * **Operation Type:** Write (State-changing)
+   *
+   * @remarks Stellar has no "cancel" operation: a pending transaction is
+   * cancelled by submitting a replacement with the same sequence number and a
+   * fee at least 10x higher (the multiplier stellar-core requires). The
+   * replacement carries a single `manage_data` operation with an empty value,
+   * which is cheap and has no effect on the SoroWill contract, so the original
+   * invocation can never be applied once the replacement is included.
+   *
+   * The replacement is built from the pending transaction's own sequence
+   * number, so it is only valid while the original is still unconfirmed. If
+   * the original has already been included in the ledger, a
+   * {@link SoroWillError} is thrown instead of submitting a no-op.
+   *
+   * @param pendingTxHash - Hash of the unconfirmed transaction to cancel.
+   * @param options - Optional per-call timeout and abort signal.
+   * @returns The replacement transaction hash.
+   * @throws {SoroWillError} If the pending transaction is already confirmed or
+   *   the replacement could not be submitted.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   * @throws {Error} If the wallet is not connected or fails to sign.
+   *
+   * @example
+   * ```ts
+   * const { txHash } = await client.cancelPendingTransaction('abc123hash');
+   * console.log(`Pending transaction replaced by: ${txHash}`);
+   * ```
+   */
+  async cancelPendingTransaction(
+    pendingTxHash: string,
+    options?: RequestOptions,
+  ): Promise<{ txHash: string }> {
+    if (this.readOnly) {
+      throw new ReadOnlyModeError('cancelPendingTransaction');
+    }
+    if (typeof pendingTxHash !== 'string' || pendingTxHash.trim() === '') {
+      throw new SoroWillError(
+        'Cannot cancel a pending transaction: a non-empty transaction hash is required.',
+      );
+    }
+    const hash = pendingTxHash.trim();
+    await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
+
+    // Refuse to "cancel" a transaction that already reached the ledger: its
+    // sequence number is consumed, so a replacement would be rejected.
+    const existing = await this.rpc(
+      () => this.rpcPool.withFailover((server) => server.getTransaction(hash)),
+      options,
+      'cancelPendingTransaction:getTransaction',
+    );
+    if (existing.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+      throw new SoroWillError(
+        'Cannot cancel a pending transaction: it has already been confirmed on-chain.',
+      );
+    }
+
+    const publicKey = await this.getWalletPublicKey();
+    const account = await this.rpc(
+      () => this.rpcPool.withFailover((server) => server.getAccount(publicKey)),
+      options,
+      'cancelPendingTransaction:getAccount',
+    );
+
+    // The replacement must reuse the pending transaction's sequence number to
+    // supersede it. The pending tx used `account.sequence + 1`; the account's
+    // current sequence is that value once the original was accepted into the
+    // mempool, so build from one below it.
+    const replacementSequence = (BigInt(account.sequence) - 1n).toString();
+    const source = new Account(publicKey, replacementSequence);
+    const baseFee = BigInt(BASE_FEE);
+    const replacementFee = (await this.computeBumpedFee(baseFee, options)).toString();
+
+    const builder = new TransactionBuilder(source, {
+      fee: replacementFee,
+      networkPassphrase: this.networkPassphrase,
+    });
+    // A `manage_data` operation with an empty value is cheap and has no effect
+    // on the SoroWill contract, so the replacement only consumes the pending
+    // transaction's sequence number.
+    builder.addOperation(
+      stellarContract.Operation.manageData({
+        name: 'sorowill-cancel',
+        value: '',
+      }),
+    );
+
+    const builtTx = builder.setTimeout(this.transactionTimeoutSeconds).build();
+    this.assertTransactionNetwork(builtTx);
+
+    const prepared = await this.rpc(
+      () => this.rpcPool.withFailover((server) => server.prepareTransaction(builtTx)),
+      options,
+      'cancelPendingTransaction:prepareTransaction',
+    );
+    this.assertTransactionNetwork(prepared);
+
+    const signedResponse = await this.wallet.signTransaction(prepared.toXDR(), {
+      networkPassphrase: this.networkPassphrase,
+    });
+    const signedXdr = normalizeSignatureResponse(signedResponse);
+    const signedTx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
+    if (!(signedTx instanceof Transaction)) {
+      throw new SoroWillError(
+        'Expected a plain Transaction envelope after signing the cancellation, but received FeeBumpTransaction',
+      );
+    }
+
+    const sendResponse = await this.rpc(
+      () => this.rpcPool.withFailover((server) => server.sendTransaction(signedTx)),
+      options,
+      'cancelPendingTransaction:sendTransaction',
+    );
+    if (sendResponse.status === 'ERROR') {
+      throw new SoroWillError(
+        'Failed to submit the replacement transaction that cancels the pending transaction. ' +
+          'The pending transaction may have already been confirmed; check its status before retrying.',
+      );
+    }
+    if (sendResponse.status === 'TRY_AGAIN_LATER') {
+      throw new SoroWillError(
+        'SoroWill RPC node is under backpressure — the cancellation transaction could not be submitted. Retry later.',
+      );
+    }
+
+    this.debugLogger.logSubmission('cancelPendingTransaction', undefined, sendResponse.hash);
+    return { txHash: sendResponse.hash };
+  }
+
   async triggerWill(willId: string, options?: RequestOptions): Promise<{ txHash: string }> {
     parseWillId(willId);
     await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
@@ -3123,6 +3390,123 @@ export class SoroWillClient {
       this.deepFreeze ? cloned.map(deepFreezeObject) : cloned,
       options,
     );
+  }
+
+  /**
+   * Streams every will owned by `owner`, one will at a time, instead of
+   * buffering the whole response in memory (#787).
+   *
+   * Results are fetched in pages of {@link WillStreamOptions.chunkSize} wills
+   * (default {@link DEFAULT_WILL_STREAM_CHUNK_SIZE}) and yielded as an async
+   * iterable, so only one page is held in memory at a time. Yields are
+   * de-duplicated by will ID and sorted ascending by `will_id`, matching
+   * {@link getWillsByOwner}.
+   *
+   * **Read-only operation** — does not require wallet authentication.
+   *
+   * @param owner - The Stellar public key of the will owner.
+   * @param options - Optional chunk size, limit, timeout and abort signal.
+   * @returns An async iterable of will records.
+   *
+   * @example
+   * ```ts
+   * for await (const will of client.streamWillsByOwner('GISSUE559...')) {
+   *   process(will);
+   * }
+   * ```
+   */
+  streamWillsByOwner(owner: string, options?: WillStreamOptions): AsyncGenerator<Will, void, undefined> {
+    assertValidStellarAddress(owner, 'owner', { allowContract: true });
+    return this.streamWillsFromPages(
+      (pageOptions) => this.getWillsByOwner(owner, pageOptions),
+      options,
+    );
+  }
+
+  /**
+   * Streams every will `beneficiary` is named in, one will at a time, instead
+   * of buffering the whole response in memory (#787).
+   *
+   * **Read-only operation** — does not require wallet authentication.
+   *
+   * @param beneficiary - The Stellar public key of the beneficiary.
+   * @param options - Optional chunk size, limit, timeout and abort signal.
+   * @returns An async iterable of will records.
+   */
+  streamWillsByBeneficiary(
+    beneficiary: string,
+    options?: WillStreamOptions,
+  ): AsyncGenerator<Will, void, undefined> {
+    assertValidStellarAddress(beneficiary, 'beneficiary', { allowContract: true });
+    return this.streamWillsFromPages(
+      (pageOptions) => this.getWillsByBeneficiary(beneficiary, pageOptions),
+      options,
+    );
+  }
+
+  /**
+   * Streams the wills for `willIds`, one will at a time, instead of buffering
+   * the whole response in memory (#787). IDs are fetched in chunks of
+   * {@link WillStreamOptions.chunkSize} and yielded in input order, repeating
+   * results for duplicate input IDs (matching {@link getWills}).
+   *
+   * @param willIds - Array of will ID strings to fetch.
+   * @param options - Optional chunk size, limit, timeout and abort signal.
+   * @returns An async iterable of will records.
+   */
+  async *streamWills(
+    willIds: string[],
+    options?: WillStreamOptions,
+  ): AsyncGenerator<Will, void, undefined> {
+    const chunkSize = normalizeStreamChunkSize(options?.chunkSize);
+    const limit = normalizeStreamLimit(options?.limit);
+    let yielded = 0;
+    for (let start = 0; start < willIds.length; start += chunkSize) {
+      if (limit !== undefined && yielded >= limit) {
+        return;
+      }
+      const chunk = willIds.slice(start, start + chunkSize);
+      const wills = await this.getWills(chunk, options);
+      for (const will of wills) {
+        if (limit !== undefined && yielded >= limit) {
+          return;
+        }
+        yielded += 1;
+        yield will;
+      }
+    }
+  }
+
+  /**
+   * Shared paging loop behind {@link streamWillsByOwner} and
+   * {@link streamWillsByBeneficiary}: pulls one page at a time and yields its
+   * wills, so peak memory is bounded by `chunkSize` rather than the full
+   * result set (#787).
+   */
+  private async *streamWillsFromPages(
+    fetchPage: (options: PaginationOptions & RequestOptions) => Promise<Will[] | PaginatedWillsResult>,
+    options?: WillStreamOptions,
+  ): AsyncGenerator<Will, void, undefined> {
+    const chunkSize = normalizeStreamChunkSize(options?.chunkSize);
+    const limit = normalizeStreamLimit(options?.limit);
+    let cursor: string | undefined;
+    let yielded = 0;
+    for (;;) {
+      const page = await fetchPage({ ...options, pageSize: chunkSize, cursor });
+      const wills = Array.isArray(page) ? page : page.wills;
+      const nextCursor = Array.isArray(page) ? null : page.nextCursor;
+      for (const will of wills) {
+        if (limit !== undefined && yielded >= limit) {
+          return;
+        }
+        yielded += 1;
+        yield will;
+      }
+      if (nextCursor === null || nextCursor === undefined || wills.length === 0) {
+        return;
+      }
+      cursor = nextCursor;
+    }
   }
 
   /**
@@ -5443,9 +5827,59 @@ export class SoroWillClient {
     if (this.readOnly) {
       throw new ReadOnlyModeError('reconnect');
     }
-    const connection = await this.wallet.reconnect();
-    await this.recoverStateAfterReconnect(connection);
-    return connection;
+    try {
+      const connection = await this.wallet.reconnect();
+      await this.recoverStateAfterReconnect(connection);
+      this.lifecycleEvents.emit('connect', {
+        publicKey: connection.publicKey,
+        network: connection.network,
+        networkPassphrase: connection.networkPassphrase,
+        reconnect: true,
+      });
+      return connection;
+    } catch (error) {
+      this.lifecycleEvents.emit('error', { operation: 'reconnect', error });
+      throw error;
+    }
+  }
+
+  /**
+   * Connects the underlying wallet adapter and emits a `connect` lifecycle
+   * event on success (or an `error` event on failure).
+   *
+   * @throws {ReadOnlyModeError} When the client was constructed with `readOnly: true`.
+   */
+  async connect(): Promise<WalletConnection> {
+    if (this.readOnly) {
+      throw new ReadOnlyModeError('connect');
+    }
+    try {
+      const connection = await this.wallet.connect();
+      this.lifecycleEvents.emit('connect', {
+        publicKey: connection.publicKey,
+        network: connection.network,
+        networkPassphrase: connection.networkPassphrase,
+        reconnect: false,
+      });
+      return connection;
+    } catch (error) {
+      this.lifecycleEvents.emit('error', { operation: 'connect', error });
+      throw error;
+    }
+  }
+
+  /**
+   * Disconnects the underlying wallet adapter (when supported) and emits a
+   * `disconnect` lifecycle event.
+   */
+  async disconnect(): Promise<void> {
+    try {
+      await this.wallet.disconnect();
+      this.lifecycleEvents.emit('disconnect', {});
+    } catch (error) {
+      this.lifecycleEvents.emit('error', { operation: 'disconnect', error });
+      throw error;
+    }
   }
 
   /**
