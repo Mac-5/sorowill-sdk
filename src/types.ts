@@ -313,6 +313,61 @@ export interface Will {
    * @since 0.1.0
    */
   readonly guardianVotes: number;
+  /**
+   * Time-lock condition: the earliest instant at which the will may be
+   * released, or `null` when the will has no time lock.
+   *
+   * Enforced on-chain at release time; {@link SoroWillClient.releaseInheritance}
+   * also checks it client-side and throws `TimeLockActiveError` before signing.
+   *
+   * @since 0.1.3
+   */
+  readonly releaseAfter: Date | null;
+}
+
+/**
+ * Kind of access an authorized address holds on a will.
+ *
+ * @since 0.1.2
+ */
+export type WillAccessType = 'owner' | 'beneficiary' | 'guardian';
+
+/**
+ * A single authorized address on a will, together with the access it holds
+ * and the timestamps relevant to that access.
+ *
+ * @since 0.1.2
+ */
+export interface WillAccessEntry {
+  /** Stellar address authorized on the will. */
+  readonly address: string;
+  /** The kind of access this address holds. */
+  readonly accessType: WillAccessType;
+  /** When this address was granted access (the will's creation time for the owner). */
+  readonly grantedAt: Date;
+  /** When this address last acted on the will, or `null` if it never has. */
+  readonly lastAccessedAt: Date | null;
+}
+
+/**
+ * Access control summary for a will, as returned by
+ * {@link SoroWillClient.getWillAccessControl}.
+ *
+ * @since 0.1.2
+ */
+export interface WillAccessControlInfo {
+  /** The will this information belongs to, as a decimal string. */
+  readonly willId: string;
+  /** The will's owner address. */
+  readonly owner: string;
+  /** Every authorized address with its access type and timestamps. */
+  readonly authorizedAddresses: readonly WillAccessEntry[];
+  /** When the will was created (used as the owner's `grantedAt`). */
+  readonly createdAt: Date;
+  /** When the will was last checked in, or `null` if it never has been. */
+  readonly lastCheckin: Date | null;
+  /** When the will was triggered, or `null` if it has never been triggered. */
+  readonly triggerTime: Date | null;
 }
 
 /** Parameters for {@link SoroWillClient.createWill}. */

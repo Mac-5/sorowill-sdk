@@ -127,6 +127,9 @@ export type {
   SorobanEventType,
   UpdateBeneficiariesParams,
   Will,
+  WillAccessControlInfo,
+  WillAccessEntry,
+  WillAccessType,
 } from './types';
 export { SOROBAN_EVENT_TYPES, WillStatus, WillErrorCode } from './types';
 export { DEFAULT_WILL_STREAM_CHUNK_SIZE } from './types';
@@ -251,6 +254,7 @@ export {
   AlreadyVotedError,
   BatchNetworkMismatchError,
   BeneficiaryNotFoundError,
+  BeneficiaryNotWhitelistedError,
   BeneficiaryValidationError,
   CheckinNotDueError,
   CheckinPeriodExceedsTtlError,
@@ -426,6 +430,13 @@ export {
   validateGuardianSignature,
 } from './utils';
 export type { NextActionableState } from './utils';
+
+export {
+  isBeneficiaryWhitelisted,
+  validateBeneficiariesAgainstWhitelist,
+  validateBeneficiaryWhitelist,
+} from './validation';
+export type { BeneficiaryWhitelistOptions } from './validation';
 
 export {
   DEFAULT_NETWORK,
